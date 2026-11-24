@@ -179,3 +179,69 @@ func TestHistoryKeys(t *testing.T) {
 		})
 	}
 }
+
+// feedKeys is feedKey for input that takes several reads to decode: it returns
+// the first want keys one viewer reads from the input.
+func feedKeys(t *testing.T, in string, want int) []byte {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer r.Close()
+	if _, err := w.WriteString(in); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	w.Close()
+
+	saved := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = saved }()
+
+	d := &DocumentViewer{}
+	keys := make([]byte, 0, want)
+	for i := 0; i < want; i++ {
+		keys = append(keys, d.readSingleChar())
+	}
+	return keys
+}
+
+func TestTerminalRepliesAreNotReadAsKeys(t *testing.T) {
+	// Read as keys, the body of a reply is a run of commands: "i" and "D" change
+	// the page tint, "=" zooms, "b" leaves the document.
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"kitty graphics OK", "\x1b_Gi=31;OK\x1b\\j"},
+		{"kitty graphics error", "\x1b_Gi=7;EBADF:could not open file\x1b\\j"},
+		{"terminal name and version", "\x1bP>|ghostty 1.4.0\x1b\\j"},
+		{"status report", "\x1bP1$r0m\x1b\\j"},
+		{"reply ended by BEL", "\x1b_Gi=31;OK\x07j"},
+		{"two replies back to back", "\x1b_Gi=1;OK\x1b\\\x1b_Gi=2;OK\x1b\\j"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := feedKey(t, tc.in); got != 'j' {
+				t.Errorf("first key = %q, want 'j' (reply not discarded)", got)
+			}
+		})
+	}
+}
+
+func TestEscThenACommandKeyIsStillTyping(t *testing.T) {
+	// Esc followed by '_' or 'P' only opens a reply when the next byte is one a
+	// reply starts with. Otherwise the keys after it are the user's.
+	got := feedKeys(t, "\x1b_jk", 3)
+	want := []byte{27, 'j', 'k'}
+	if string(got) != string(want) {
+		t.Errorf("keys = %q, want %q", got, want)
+	}
+}
+
+func TestACutShortReplySwallowsABoundedAmount(t *testing.T) {
+	in := "\x1b_G" + string(make([]byte, maxStringReply)) + "j"
+	if got := feedKey(t, in); got != 'j' {
+		t.Errorf("key after an unterminated reply = %q, want 'j'", got)
+	}
+}

@@ -1026,13 +1026,24 @@ func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int,
 		if err := kittySendPNG(imagePath, newID, widthChars, estimatedLines, 0); err != nil {
 			return 0
 		}
+		if termViaTmux {
+			// The upload above drew nothing; these cells are what show it. An
+			// image box larger than the screen (the half-page view fills the
+			// height and lets the width overflow) is clipped by the terminal
+			// when it is placed directly; as text it has to be clipped here,
+			// or the overflow wraps onto the next row.
+			termWidth, termHeight := d.getTerminalSize()
+			cols, rows := visibleCells(widthChars, estimatedLines,
+				1+horizontalOffset, d.clickMap.originRow, termWidth, termHeight)
+			os.Stdout.WriteString(placeholderGrid(newID, cols, rows, horizontalOffset))
+		}
 		// Flicker-free swap: the new image was just placed over the old one, so
 		// now delete the PREVIOUS image by id. Drawing-then-deleting (rather than
 		// the old delete-all-then-draw) means a reload never blanks the screen
 		// while the new page transmits. d=I also frees the old image's data, so a
 		// long LaTeX session doesn't accumulate images in terminal memory.
 		if d.lastKittyImageID != 0 && d.lastKittyImageID != newID {
-			fmt.Printf("\033_Ga=d,d=I,i=%d\033\\", d.lastKittyImageID)
+			kittyDeleteImage(d.lastKittyImageID)
 		}
 		d.lastKittyImageID = newID
 		return estimatedLines

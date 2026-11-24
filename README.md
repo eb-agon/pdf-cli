@@ -139,6 +139,7 @@ The viewer handles partially-written PDFs gracefully, waiting for the file to st
 Optimized for terminals with graphics support:
 
 - **Kitty** (recommended) - Native cell size detection via escape sequences
+- **Ghostty** - Kitty graphics protocol, including over ssh and inside tmux
 - Foot
 - WezTerm
 - iTerm2
@@ -146,6 +147,42 @@ Optimized for terminals with graphics support:
 - xterm (with Sixel support)
 
 Works in any terminal, but image rendering quality depends on terminal capabilities.
+
+### Ghostty and Kitty over ssh
+
+Over ssh these terminals look like a plain xterm (`TERM` is rewritten and
+`TERM_PROGRAM` is not forwarded), so the viewer asks the terminal itself whether
+it speaks the kitty graphics protocol. Pages are then sent as PNG data through
+the connection, since the terminal cannot read files on the remote machine.
+
+### Inside tmux
+
+When the terminal attached to tmux is Ghostty or Kitty, pages are drawn at full
+resolution through tmux:
+
+- The viewer asks tmux which terminal is attached, turns `allow-passthrough` on
+  for its own pane while it runs, and puts the pane's setting back on exit.
+  Nothing needs to be added to `tmux.conf`. Tested with tmux 3.4.
+- Pages are shown with the kitty protocol's unicode placeholders, so they stay
+  inside their pane and follow it through splits, zoom, window switches and
+  resizes.
+- The viewer draws on the alternate screen and leaves the pane's scrollback as
+  it found it.
+- If you attach from a different terminal while a page is on screen, press `r`
+  (or any key that redraws) to send the page to the new terminal.
+- The thin rule that marks a forward-sync jump is not drawn inside tmux; the
+  margin arrows are.
+
+With any other terminal attached, tmux gets the generic renderer as before.
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `DOCVIEWER_GRAPHICS` | `kitty` forces the kitty graphics protocol (through tmux when inside it); `termimg` forces the generic renderer. Default: detect. |
+| `DOCVIEWER_KITTY_XFER` | `file` or `direct`: how pages reach a kitty-protocol terminal. Default: probe; always `direct` inside tmux. |
+| `DOCVIEWER_CELL_SIZE` | Cell size in pixels as `WxH` (e.g. `16x32`), when detection gets it wrong. |
+| `DOCVIEWER_SUPERSAMPLE` | How many times larger than its on-screen size a page is rasterized (1 to 8, default 1.6). Lower it on a slow link. |
 
 ## How It Works
 

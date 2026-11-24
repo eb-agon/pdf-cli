@@ -31,9 +31,9 @@ func (d *DocumentViewer) displayCurrentPage() {
 		fmt.Print("\033[H") // Move cursor home
 		d.skipClear = false
 	} else {
-		// Normal case: full screen clear
+		// Normal case: full screen clear. The screen only: the viewer runs on
+		// the alternate screen, and the scrollback behind it is the user's.
 		fmt.Print("\033[2J")
-		fmt.Print("\033[3J")
 		fmt.Print("\033[H")
 	}
 	fmt.Print("\033[1G")
@@ -387,7 +387,9 @@ func (d *DocumentViewer) drawFlash(termWidth int) {
 // rule would sit under it forever, so every redraw re-places (or drops) it.
 func (d *DocumentViewer) drawFlashRule(row int) {
 	d.clearFlashRule()
-	if time.Now().After(d.flashUntil) || d.detectTerminalType() != "kitty" {
+	// Not through tmux: there the page occupies its cells as placeholder text,
+	// and a cell can name only one image, so nothing can be laid over it.
+	if time.Now().After(d.flashUntil) || d.detectTerminalType() != "kitty" || termViaTmux {
 		return
 	}
 	path, err := syncRulePNG(d.tempDir)
@@ -793,6 +795,11 @@ func (d *DocumentViewer) showDebugInfo(inputChan <-chan byte) {
 		xfer = "file (t=f)"
 	}
 	p(fmt.Sprintf("Kitty transfer mode: %s", xfer))
+	graphics := d.detectTerminalType()
+	if termViaTmux {
+		graphics = fmt.Sprintf("kitty through tmux (unicode placeholders; outer terminal: %s)", tmuxOuterTerminal())
+	}
+	p(fmt.Sprintf("Graphics: %s", graphics))
 	p("")
 	p("Press any key to return...")
 	<-inputChan

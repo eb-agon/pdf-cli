@@ -27,8 +27,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/term"
 )
 
 // kittyImageID is a process-wide counter for kitty graphics image ids, seeded
@@ -36,7 +34,25 @@ import (
 // reused (and then wrongly deleted by the swap logic).
 var kittyImageID = uint32(os.Getpid()<<16) + uint32(time.Now().UnixMicro()&0xFFFF)
 
-func nextKittyImageID() uint32 { return atomic.AddUint32(&kittyImageID, 1) }
+// nextKittyImageID returns a fresh image id. Through tmux the id has to be one
+// a placeholder cell can spell (see placeholderImageID).
+func nextKittyImageID() uint32 {
+	n := atomic.AddUint32(&kittyImageID, 1)
+	if termViaTmux {
+		return placeholderImageID(uint32(os.Getpid()), n)
+	}
+	return n
+}
+
+// kittyCommand formats one kitty graphics command, wrapped for tmux
+// passthrough when the terminal is reached through tmux.
+func kittyCommand(control, payload string) string {
+	cmd := "\x1b_G" + control + ";" + payload + "\x1b\\"
+	if termViaTmux {
+		return tmuxWrap(cmd)
+	}
+	return cmd
+}
 
 const (
 	kittyXferDirect = iota // chunked base64 of the PNG bytes (mandatory protocol surface)
@@ -61,7 +77,10 @@ func (d *DocumentViewer) probeKittyTransferMode() {
 		case "direct":
 			return
 		}
-		if d.detectTerminalType() != "kitty" {
+		// Through tmux the terminal is usually on another machine (the viewer
+		// on a remote box, the terminal at the far end of ssh) and cannot be
+		// asked without its reply coming back as keystrokes; stay on direct.
+		if d.detectTerminalType() != "kitty" || termViaTmux {
 			return
 		}
 		if probeKittyFileXfer(d.tempDir) {
@@ -91,56 +110,18 @@ func probeKittyFileXfer(tempDir string) bool {
 		return false
 	}
 
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
-		return false
-	}
-	defer tty.Close()
-
-	fd := int(tty.Fd())
-	oldState, err := term.MakeRaw(fd)
-	if err != nil {
-		return false
-	}
-	defer term.Restore(fd, oldState)
-
+	// Success response: ESC _ G i=<id> ; OK ESC \  — anything else (an error
+	// message, as when the terminal is at the far end of ssh and has no such
+	// file; no reply at all) means we stay on direct transmission.
 	id := nextKittyImageID()
-	fmt.Fprintf(tty, "\x1b_Ga=q,f=100,t=f,i=%d;%s\x1b\\",
-		id, base64.StdEncoding.EncodeToString([]byte(absPath)))
-
-	// Success response: ESC _ G i=<id> ; OK ESC \  — anything else (error
-	// message, no reply) means we stay on direct transmission.
-	resultChan := make(chan string, 1)
-	go func() {
-		var acc []byte
-		buf := make([]byte, 256)
-		for {
-			n, rerr := tty.Read(buf)
-			if n > 0 {
-				acc = append(acc, buf[:n]...)
-				if bytes.Contains(acc, []byte("\x1b\\")) {
-					resultChan <- string(acc)
-					return
-				}
-			}
-			if rerr != nil {
-				resultChan <- string(acc)
-				return
-			}
-		}
-	}()
-
-	select {
-	case resp := <-resultChan:
-		return strings.Contains(resp, ";OK")
-	case <-time.After(300 * time.Millisecond):
-		return false
-	}
+	reply, ok := ttyQuery(fmt.Sprintf("\x1b_Ga=q,f=100,t=f,i=%d;%s\x1b\\",
+		id, base64.StdEncoding.EncodeToString([]byte(absPath))))
+	return ok && strings.Contains(reply, ";OK")
 }
 
 // kittyDeleteImage removes an image and its placements by id.
 func kittyDeleteImage(id uint32) {
-	fmt.Printf("\x1b_Ga=d,d=I,i=%d\x1b\\", id)
+	fmt.Print(kittyCommand(fmt.Sprintf("a=d,d=I,i=%d,q=2", id), ""))
 }
 
 // clearKittyGraphics removes every placement owned by this viewer. Redraws
@@ -190,16 +171,31 @@ func syncRulePNG(tempDir string) (string, error) {
 // to cols x rows cells, using the transfer mode chosen by the startup probe.
 // z is the stacking order: 0 for pages, a positive value for overlays drawn on
 // top of them (the sync rule).
+//
+// Through tmux the image is only uploaded, as a virtual placement that draws
+// nothing: the caller shows it by writing placeholderGrid for the same id and
+// cell box.
 func kittySendPNG(imagePath string, id uint32, cols, rows, z int) error {
 	if kittyXferMode == kittyXferFile {
 		if abs, err := filepath.Abs(imagePath); err == nil {
-			_, err = fmt.Printf("\x1b_Ga=T,f=100,t=f,i=%d,c=%d,r=%d,z=%d,q=2;%s\x1b\\",
-				id, cols, rows, z, base64.StdEncoding.EncodeToString([]byte(abs)))
+			_, err = fmt.Print(kittyCommand(
+				kittyPlacement(id, cols, rows, z)+",f=100,t=f,q=2",
+				base64.StdEncoding.EncodeToString([]byte(abs))))
 			return err
 		}
 		// Path resolution failed; fall through to direct transmission.
 	}
 	return kittySendPNGDirect(imagePath, id, cols, rows, z)
+}
+
+// kittyPlacement is the part of a transmit command that says where the image
+// goes: on screen at the cursor, or (through tmux) a virtual placement for
+// placeholder cells to reference.
+func kittyPlacement(id uint32, cols, rows, z int) string {
+	if termViaTmux {
+		return fmt.Sprintf("a=T,U=1,i=%d,c=%d,r=%d", id, cols, rows)
+	}
+	return fmt.Sprintf("a=T,i=%d,c=%d,r=%d,z=%d", id, cols, rows, z)
 }
 
 // kittySendPNGDirect streams the PNG file bytes as chunked base64 (t=d). The
@@ -213,7 +209,7 @@ func kittySendPNGDirect(imagePath string, id uint32, cols, rows, z int) error {
 
 	const chunkSize = 4096
 	var out strings.Builder
-	out.Grow(len(enc) + (len(enc)/chunkSize+1)*32 + 64)
+	out.Grow(len(enc) + (len(enc)/chunkSize+1)*48 + 64)
 
 	first := true
 	for len(enc) > 0 {
@@ -226,10 +222,10 @@ func kittySendPNGDirect(imagePath string, id uint32, cols, rows, z int) error {
 		}
 		if first {
 			first = false
-			fmt.Fprintf(&out, "\x1b_Ga=T,f=100,i=%d,c=%d,r=%d,z=%d,q=2,m=%d;%s\x1b\\",
-				id, cols, rows, z, more, piece)
+			out.WriteString(kittyCommand(
+				fmt.Sprintf("%s,f=100,q=2,m=%d", kittyPlacement(id, cols, rows, z), more), piece))
 		} else {
-			fmt.Fprintf(&out, "\x1b_Gm=%d,q=2;%s\x1b\\", more, piece)
+			out.WriteString(kittyCommand(fmt.Sprintf("m=%d,q=2", more), piece))
 		}
 	}
 

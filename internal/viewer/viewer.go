@@ -93,6 +93,23 @@ type DocumentViewer struct {
 	mouseCol int
 	mouseRow int
 
+	// readingKeys is set once the goroutine that reads keys has started, after
+	// which the terminal must not be queried (see ttyQuery); askedCellWidth and
+	// askedCellHeight keep the cell size the terminal reported before that.
+	// Main-goroutine only.
+	readingKeys     bool
+	askedCellWidth  float64
+	askedCellHeight float64
+
+	// restorePassthrough hands the tmux pane's passthrough option back (nil
+	// outside tmux); kept here for the signal path, which skips Run's defers.
+	restorePassthrough func()
+
+	// unreadKey is a keypress readSingleChar read while deciding whether an Esc
+	// opened a terminal reply, and hands out on its next call (0: none). Only
+	// the goroutine that reads keys touches it.
+	unreadKey byte
+
 	// Forward-sync marker (\lv in vim): a control-file jump that carries a
 	// synctex point (see parseSyncCommand) draws a margin marker at the
 	// mapped row. It persists across redraws (reload, zoom, crop) while the
@@ -513,11 +530,22 @@ func (d *DocumentViewer) Run() bool {
 	if d.doc != nil {
 		defer d.doc.Close()
 	}
+	// Identify the terminal first: it can mean a query, and everything below
+	// depends on the answer. Through tmux the pane needs passthrough for as long
+	// as graphics commands are sent, which includes cleanup deleting the images:
+	// deferred before cleanup so that it is handed back after.
+	if d.detectTerminalType(); termViaTmux {
+		restorePassthrough := tmuxAllowPassthrough()
+		defer restorePassthrough()
+		d.restorePassthrough = restorePassthrough
+	}
 	defer d.cleanup()
 	defer d.saveConfig()
 
-	// Cache cell size before entering raw mode (for Kitty query)
+	// Cache cell size before entering raw mode (for Kitty query), along with the
+	// terminal size it was measured at, so the first page does not measure again.
 	d.cellWidth, d.cellHeight = d.detectCellSize()
+	d.lastTermCols, d.lastTermRows = d.getTerminalSize()
 
 	// Decide the kitty graphics transfer mode (t=f vs chunked direct) once, before
 	// the stdin-reading goroutine starts — the probe reads a reply from the tty.
@@ -539,6 +567,11 @@ func (d *DocumentViewer) Run() bool {
 	savedStderr, devNull := silenceStderr()
 	defer restoreStderr(savedStderr, devNull)
 
+	// Draw on the alternate screen: what was in the terminal before comes back
+	// on exit, and a session of page turns leaves nothing in the scrollback.
+	fmt.Print("\033[?1049h")
+	defer fmt.Print("\033[?1049l")
+
 	fmt.Print("\033[?25l")
 	defer fmt.Print("\033[?25h") // Show cursor on exit
 	defer clearTerminalTitle()
@@ -555,8 +588,12 @@ func (d *DocumentViewer) Run() bool {
 	// Only kitty-family terminals (kitty, ghostty, agterm) understand this;
 	// others ignore the private-marker CSI as a no-op.
 	if d.detectTerminalType() == "kitty" {
-		fmt.Print("\x1b[>1u")
-		defer fmt.Print("\x1b[<u")
+		// tmux has no kitty keyboard protocol to switch on; the Ctrl-key
+		// bindings reach the viewer through it as plain control bytes.
+		if !termViaTmux {
+			fmt.Print("\x1b[>1u")
+			defer fmt.Print("\x1b[<u")
+		}
 		// SGR mouse reporting (button press/release only, no motion) for the
 		// Opt+click synctex jump. The click→cell mapping relies on the kitty
 		// graphics c/r cell placement, so this stays kitty-gated too.
@@ -568,8 +605,15 @@ func (d *DocumentViewer) Run() bool {
 	installSignalCleanup()
 	sigRestoreMu.Lock()
 	sigRestore = func() {
-		fmt.Print("\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?25h\x1b]2;\x07")
+		fmt.Print("\x1b[?1006l\x1b[?1000l")
+		if !termViaTmux {
+			fmt.Print("\x1b[<u")
+		}
+		fmt.Print("\x1b[?25h\x1b]2;\x07\x1b[?1049l")
 		d.clearKittyGraphics()
+		if d.restorePassthrough != nil {
+			d.restorePassthrough()
+		}
 		d.agterm.close()
 		if d.oldState != nil {
 			term.Restore(int(os.Stdin.Fd()), d.oldState)
@@ -623,7 +667,8 @@ func (d *DocumentViewer) Run() bool {
 	d.startControlServer(stopChan)
 	defer d.cleanupControlServer()
 
-	// Input reader goroutine
+	// Input reader goroutine. From here on the terminal cannot be queried.
+	d.readingKeys = true
 	go func() {
 		for {
 			char := d.readSingleChar()
@@ -638,6 +683,12 @@ func (d *DocumentViewer) Run() bool {
 	// Ticker for file change checking
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+
+	// The terminal changed size: a window resize, or in tmux a pane split,
+	// zoom or a client of another size attaching.
+	resizeChan := make(chan os.Signal, 1)
+	signal.Notify(resizeChan, syscall.SIGWINCH)
+	defer signal.Stop(resizeChan)
 
 	d.displayCurrentPage()
 
@@ -718,12 +769,32 @@ func (d *DocumentViewer) Run() bool {
 		case <-flashChan:
 			d.clearFlashRule()
 			os.Stdout.Sync()
+		case <-resizeChan:
+			waitForResizeToSettle(resizeChan)
+			d.displayCurrentPage()
 		case <-ticker.C:
 			if d.checkAndReload() {
 				d.startReloadRender(reloadRenderChan)
 			}
 		case <-reloadRenderChan:
 			d.displayCurrentPage()
+		}
+	}
+}
+
+// resizeSettle is how long the size must hold still before the page is drawn
+// for it. Dragging a window edge reports a size per step; drawing each one
+// would render and transmit a page per step.
+const resizeSettle = 80 * time.Millisecond
+
+// waitForResizeToSettle returns once no further resize has been reported for
+// resizeSettle.
+func waitForResizeToSettle(resized <-chan os.Signal) {
+	for {
+		select {
+		case <-resized:
+		case <-time.After(resizeSettle):
+			return
 		}
 	}
 }

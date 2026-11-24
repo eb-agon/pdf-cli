@@ -3,7 +3,9 @@ package viewer
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -26,9 +28,73 @@ func (d *DocumentViewer) getTerminalSize() (int, int) {
 	return 80, 24 // Fallback default
 }
 
-// detecting Terminal
+// The terminal is identified once per process: the answer cannot change while
+// the viewer runs, finding it out can mean a round trip to the terminal, and
+// that round trip has to happen before the goroutine that reads keys starts.
+var (
+	termOnce sync.Once
+	termKind string
+
+	// termViaTmux is set when images go to a kitty-protocol terminal through
+	// tmux: every graphics command is wrapped for passthrough and pages are
+	// shown with unicode placeholders (see tmux.go, placeholder.go).
+	termViaTmux bool
+)
+
+// detectTerminalType names the terminal the viewer draws on. "kitty" means the
+// kitty graphics protocol is available, whichever terminal provides it and
+// whether or not tmux is in between.
 func (d *DocumentViewer) detectTerminalType() string {
-	if termProgram := os.Getenv("TERM_PROGRAM"); termProgram != "" {
+	termOnce.Do(func() {
+		termKind, termViaTmux = resolveTerminal(os.Getenv, inTmux(), tmuxOuterTerminal, probeKittyGraphics)
+	})
+	return termKind
+}
+
+// resolveTerminal decides the terminal kind and whether graphics go through
+// tmux. Its inputs are passed in so the decision can be tested without a
+// terminal: getenv reads the environment, outerTerminal asks tmux what is
+// attached, probe asks the terminal itself whether it speaks kitty graphics.
+//
+// DOCVIEWER_GRAPHICS overrides the detection: "kitty" forces the kitty
+// protocol (through tmux when inside it), "termimg" forces the generic
+// go-termimg path.
+func resolveTerminal(getenv func(string) string, tmux bool, outerTerminal func() string, probe func() bool) (kind string, viaTmux bool) {
+	envKind := envTerminalType(getenv)
+	switch getenv("DOCVIEWER_GRAPHICS") {
+	case "kitty":
+		return "kitty", tmux
+	case "termimg":
+		if envKind == "kitty" {
+			return "xterm", false
+		}
+		return envKind, false
+	}
+	if tmux {
+		// Inside tmux the environment describes tmux (or whatever terminal the
+		// server happened to be started from), and a query would be answered by
+		// tmux or come back as keystrokes. tmux knows what is attached.
+		if speaksKittyPlaceholders(outerTerminal()) {
+			return "kitty", true
+		}
+		if envKind == "kitty" {
+			return "tmux", false
+		}
+		return envKind, false
+	}
+	if envKind == "xterm" || envKind == "unknown" {
+		// Over ssh a kitty-protocol terminal looks like any xterm: TERM is
+		// rewritten and TERM_PROGRAM is not forwarded. Ask it.
+		if probe() {
+			return "kitty", false
+		}
+	}
+	return envKind, false
+}
+
+// envTerminalType guesses the terminal from the environment alone.
+func envTerminalType(getenv func(string) string) string {
+	if termProgram := getenv("TERM_PROGRAM"); termProgram != "" {
 		switch termProgram {
 		case "WezTerm":
 			return "wezterm"
@@ -42,10 +108,10 @@ func (d *DocumentViewer) detectTerminalType() string {
 			return "apple_terminal"
 		}
 	}
-	if os.Getenv("KITTY_WINDOW_ID") != "" || os.Getenv("KITTY_PID") != "" {
+	if getenv("KITTY_WINDOW_ID") != "" || getenv("KITTY_PID") != "" {
 		return "kitty"
 	}
-	term := os.Getenv("TERM")
+	term := getenv("TERM")
 	switch {
 	case strings.Contains(term, "kitty"):
 		return "kitty"
@@ -65,6 +131,77 @@ func (d *DocumentViewer) detectTerminalType() string {
 		return "screen"
 	}
 	return "unknown"
+}
+
+// ttyQueryTimeout bounds one query round trip. It is a ceiling for a terminal
+// that never answers, not the expected wait: ttyQuery returns as soon as the
+// reply is complete, so a slow ssh link costs its own latency and no more.
+const ttyQueryTimeout = time.Second
+
+// da1Reply matches a primary device attributes report, which every terminal
+// sends in answer to CSI c.
+var da1Reply = regexp.MustCompile(`\x1b\[\?[0-9;]*c`)
+
+// ttyQuery sends a query to the terminal and returns what came back before the
+// terminal's device-attributes report. The query is followed by a
+// device-attributes request, which every terminal answers and answers in
+// order, so the report marks the end of the reply whether or not the terminal
+// understood the query: nothing is left in the input to be read as keys later,
+// and an unsupported query costs one round trip rather than a full timeout. ok
+// is false when the terminal could not be asked or did not report in time.
+//
+// Must not run while another goroutine reads the terminal: the two would split
+// the reply between them, and the half that reached the key reader would be
+// taken for typing.
+func ttyQuery(query string) (reply string, ok bool) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return "", false
+	}
+	defer tty.Close()
+
+	// The descriptor is reached through SyscallConn rather than Fd: Fd puts
+	// the file back into blocking mode, and a blocking read ignores the
+	// deadline below — a terminal that stays silent would hang the viewer
+	// until the next keypress, and then swallow it.
+	conn, err := tty.SyscallConn()
+	if err != nil {
+		return "", false
+	}
+	var oldState *term.State
+	if cerr := conn.Control(func(fd uintptr) { oldState, err = term.MakeRaw(int(fd)) }); cerr != nil || err != nil {
+		return "", false
+	}
+	defer conn.Control(func(fd uintptr) { term.Restore(int(fd), oldState) })
+
+	if err := tty.SetReadDeadline(time.Now().Add(ttyQueryTimeout)); err != nil {
+		return "", false
+	}
+	if _, err := tty.WriteString(query + "\x1b[c"); err != nil {
+		return "", false
+	}
+
+	var acc []byte
+	buf := make([]byte, 256)
+	for {
+		n, err := tty.Read(buf)
+		acc = append(acc, buf[:n]...)
+		if loc := da1Reply.FindIndex(acc); loc != nil {
+			return string(acc[:loc[0]]), true
+		}
+		if err != nil {
+			return string(acc), false
+		}
+	}
+}
+
+// probeKittyGraphics asks the terminal whether it implements the kitty
+// graphics protocol, with the query the protocol defines for that: a 1x1 image
+// that is checked and discarded. A terminal that implements it answers; any
+// other ignores the unknown sequence.
+func probeKittyGraphics() bool {
+	reply, ok := ttyQuery("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\")
+	return ok && strings.Contains(reply, "\x1b_Gi=31;OK")
 }
 
 func (d *DocumentViewer) getTerminalCellSize() (float64, float64) {
@@ -124,6 +261,11 @@ func (d *DocumentViewer) detectCellSize() (float64, float64) {
 		}
 	}
 
+	// What the terminal said at startup, when it can no longer be asked.
+	if d.askedCellWidth > 0 && d.askedCellHeight > 0 {
+		return d.askedCellWidth, d.askedCellHeight
+	}
+
 	// Fallback to hardcoded values
 	termType := d.detectTerminalType()
 	switch termType {
@@ -179,60 +321,34 @@ func (d *DocumentViewer) getTerminalPixelSize() (int, int) {
 	return 0, 0
 }
 
-// getKittyCellSize queries Kitty for actual cell size using escape sequence
-// Uses /dev/tty directly for reliable TTY access
+// cellSizeReply matches the answer to CSI 16 t: CSI 6 ; height ; width t.
+var cellSizeReply = regexp.MustCompile(`\x1b\[6;(\d+);(\d+)t`)
+
+// getKittyCellSize asks a kitty-protocol terminal for its cell size in pixels.
+// Not asked through tmux, which would answer for itself: there the pane's own
+// pixel size (getTerminalPixelSize) is what tmux derived from the terminal.
+// Only asked before the key reader starts (see ttyQuery). A later re-detection,
+// after a resize or the 'r' key, takes the pane's pixel size, and failing that
+// the answer from startup.
 func (d *DocumentViewer) getKittyCellSize() (float64, float64) {
-	if d.detectTerminalType() != "kitty" {
+	if d.detectTerminalType() != "kitty" || termViaTmux {
 		return 0, 0
 	}
-
-	// Open /dev/tty directly for reliable TTY access
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
+	if d.readingKeys {
 		return 0, 0
 	}
-	defer tty.Close()
-
-	// Save terminal state and set raw mode for reading response
-	fd := int(tty.Fd())
-	oldState, err := term.MakeRaw(fd)
-	if err != nil {
+	reply, _ := ttyQuery("\x1b[16t")
+	m := cellSizeReply.FindStringSubmatch(reply)
+	if m == nil {
 		return 0, 0
 	}
-	defer term.Restore(fd, oldState)
-
-	// Query cell size: CSI 16 t -> CSI 6 ; height ; width t
-	tty.WriteString("\x1b[16t")
-	tty.Sync()
-
-	// Read response with timeout
-	resultChan := make(chan string, 1)
-	go func() {
-		buf := make([]byte, 32)
-		n, _ := tty.Read(buf)
-		if n > 0 {
-			resultChan <- string(buf[:n])
-		} else {
-			resultChan <- ""
-		}
-	}()
-
-	select {
-	case response := <-resultChan:
-		if response == "" {
-			return 0, 0
-		}
-		// Parse response: ESC [ 6 ; height ; width t
-		var cellHeight, cellWidth int
-		if _, err := fmt.Sscanf(response, "\x1b[6;%d;%dt", &cellHeight, &cellWidth); err == nil {
-			if cellWidth > 0 && cellHeight > 0 {
-				return float64(cellWidth), float64(cellHeight)
-			}
-		}
-	case <-time.After(100 * time.Millisecond):
-		// Timeout - terminal didn't respond
+	var cellHeight, cellWidth int
+	fmt.Sscan(m[1], &cellHeight)
+	fmt.Sscan(m[2], &cellWidth)
+	if cellWidth > 0 && cellHeight > 0 {
+		d.askedCellWidth, d.askedCellHeight = float64(cellWidth), float64(cellHeight)
+		return d.askedCellWidth, d.askedCellHeight
 	}
-
 	return 0, 0
 }
 
@@ -384,6 +500,42 @@ func firstIntField(s string) int {
 	return n
 }
 
+// stringReplyLead reports whether lead, the byte after "ESC intro", opens a
+// string a terminal sends in reply to a query rather than something typed: a
+// kitty graphics response (ESC _ G ...) or a device-control report such as the
+// terminal's name and version (ESC P > | ...) or a status report (ESC P 1 $ r).
+// The lead is what tells them from a person pressing Esc and then '_' or 'P',
+// which are commands.
+func stringReplyLead(intro, lead byte) bool {
+	switch intro {
+	case '_':
+		return lead == 'G'
+	case 'P':
+		return lead == '>' || lead == '!' || lead == '0' || lead == '1'
+	}
+	return false
+}
+
+// maxStringReply bounds how much input is discarded as one terminal reply, so
+// a reply cut short cannot swallow a session's worth of keys.
+const maxStringReply = 4096
+
+// skipStringReply discards the rest of a terminal reply string, up to and
+// including its terminator (ESC \ or BEL).
+func skipStringReply() {
+	b := make([]byte, 1)
+	esc := false
+	for i := 0; i < maxStringReply; i++ {
+		if n, _ := os.Stdin.Read(b); n != 1 {
+			return
+		}
+		if b[0] == 0x07 || (esc && b[0] == '\\') {
+			return
+		}
+		esc = b[0] == 27
+	}
+}
+
 func (d *DocumentViewer) readSingleChar() byte {
 	buf := make([]byte, 1)
 	b := make([]byte, 1)
@@ -391,6 +543,12 @@ func (d *DocumentViewer) readSingleChar() byte {
 	// are consumed here and must not surface at all — even a synthetic 0 byte
 	// would trigger a redraw per event, and a wheel gesture emits dozens.
 	for {
+		if d.unreadKey != 0 {
+			// The byte read past an Esc that turned out not to open a reply.
+			key := d.unreadKey
+			d.unreadKey = 0
+			return key
+		}
 		n, _ := os.Stdin.Read(buf)
 		if n == 0 {
 			return 0
@@ -421,6 +579,26 @@ func (d *DocumentViewer) readSingleChar() byte {
 		n, _ = os.Stdin.Read(b)
 		if n != 1 {
 			return 27 // bare ESC
+		}
+		if b[0] == '_' || b[0] == 'P' {
+			// A terminal's reply to a query can reach the input: one that
+			// arrived after its query gave up waiting, or one tmux handed back
+			// as keys. Its body is text — "Gi=31;OK" — and read as keys that
+			// text is a string of commands. Discard the whole reply.
+			intro := b[0]
+			if n, _ = os.Stdin.Read(b); n != 1 {
+				return 27
+			}
+			if stringReplyLead(intro, b[0]) {
+				skipStringReply()
+				continue
+			}
+			// Esc, then a key, then another key: the first two are dropped as
+			// before, the third is a keypress in its own right.
+			if b[0] < 0x80 && b[0] != 27 {
+				d.unreadKey = b[0]
+			}
+			return 27
 		}
 		if b[0] != '[' && b[0] != 'O' {
 			return 27 // ESC + something else; don't leak it as a crop/dark command
