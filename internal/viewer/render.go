@@ -91,34 +91,80 @@ type clickMap struct {
 	originCol, originRow int // 1-based cell of the image's top-left corner
 	cols, rows           int // cell box the terminal scales the image into
 	pxW, pxH             float64
-	targets              []clickTarget
+	// The part of the cell box the image covers, as fractions of the box: its
+	// top-left corner and its size. All zero means the whole box (see fitBox).
+	fitX0, fitY0, fitW, fitH float64
+	targets                  []clickTarget
+}
+
+// fitBox records that the terminal does not stretch the image over the cell
+// box but fits it inside, keeping its proportions and centring it: what kitty
+// and Ghostty do with a virtual placement, the kind shown through tmux (see
+// placeholder.go). The box is a whole number of cells and the image is not,
+// so the image leaves a margin on two sides — a fraction of a cell when the
+// cell size is known exactly, rows of them when it is not — and a cell stands
+// for a different point of the page than it would if the image filled the box.
+// cellW and cellH are the size of a cell in pixels.
+func (m *clickMap) fitBox(cellW, cellH float64) {
+	boxW, boxH := float64(m.cols)*cellW, float64(m.rows)*cellH
+	if boxW <= 0 || boxH <= 0 || m.pxW <= 0 || m.pxH <= 0 {
+		return
+	}
+	scale := math.Min(boxW/m.pxW, boxH/m.pxH)
+	m.fitW, m.fitH = m.pxW*scale/boxW, m.pxH*scale/boxH
+	m.fitX0, m.fitY0 = (1-m.fitW)/2, (1-m.fitH)/2
+}
+
+// boxToImage turns a position in the cell box into one in the image, both as
+// fractions of the whole; outside 0..1 it is in the margin beside the image.
+func (m *clickMap) boxToImage(bx, by float64) (ix, iy float64) {
+	if m.fitW <= 0 || m.fitH <= 0 {
+		return bx, by
+	}
+	return (bx - m.fitX0) / m.fitW, (by - m.fitY0) / m.fitH
+}
+
+// imageToBox is the inverse of boxToImage.
+func (m *clickMap) imageToBox(ix, iy float64) (bx, by float64) {
+	if m.fitW <= 0 || m.fitH <= 0 {
+		return ix, iy
+	}
+	return m.fitX0 + ix*m.fitW, m.fitY0 + iy*m.fitH
+}
+
+// pagePoint maps a pixel of the image inside the target to the point of the
+// page it shows, in PDF points with top-left origin.
+func (t *clickTarget) pagePoint(px, py float64) (x, y float64) {
+	gx := t.fx0 + (px-t.x0)/(t.x1-t.x0)*(t.fx1-t.fx0)
+	gy := t.fy0 + (py-t.y0)/(t.y1-t.y0)*(t.fy1-t.fy0)
+	return math.Min(math.Max(gx*t.pageW, 0), t.pageW), math.Min(math.Max(gy*t.pageH, 0), t.pageH)
 }
 
 // cellToPDF maps a 1-based terminal cell to (page, x, y) in PDF points with
-// top-left origin. The kitty graphics protocol stretches the transmitted image
-// to exactly cols x rows cells, so a fraction of the cell box equals the same
-// fraction of the image pixels; the cell center stands in for the unknowable
-// sub-cell click position. ok is false outside the displayed image (or inside
-// the gap between dual-mode pages).
+// top-left origin. A directly placed image is stretched to exactly cols x rows
+// cells, so a fraction of the cell box equals the same fraction of the image
+// pixels; an image shown through tmux is fitted inside the box instead (see
+// fitBox). The cell center stands in for the unknowable sub-cell click
+// position. ok is false outside the displayed image (or inside the gap between
+// dual-mode pages).
 func (m *clickMap) cellToPDF(col, row int) (page0 int, x, y float64, ok bool) {
 	if m.cols <= 0 || m.rows <= 0 || m.pxW <= 0 || m.pxH <= 0 {
 		return 0, 0, 0, false
 	}
-	fx := (float64(col-m.originCol) + 0.5) / float64(m.cols)
-	fy := (float64(row-m.originRow) + 0.5) / float64(m.rows)
+	fx, fy := m.boxToImage(
+		(float64(col-m.originCol)+0.5)/float64(m.cols),
+		(float64(row-m.originRow)+0.5)/float64(m.rows))
 	if fx < 0 || fx >= 1 || fy < 0 || fy >= 1 {
 		return 0, 0, 0, false
 	}
 	px := fx * m.pxW
 	py := fy * m.pxH
-	for _, t := range m.targets {
+	for i := range m.targets {
+		t := &m.targets[i]
 		if px < t.x0 || px >= t.x1 || py < t.y0 || py >= t.y1 {
 			continue
 		}
-		gx := t.fx0 + (px-t.x0)/(t.x1-t.x0)*(t.fx1-t.fx0)
-		gy := t.fy0 + (py-t.y0)/(t.y1-t.y0)*(t.fy1-t.fy0)
-		x = math.Min(math.Max(gx*t.pageW, 0), t.pageW)
-		y = math.Min(math.Max(gy*t.pageH, 0), t.pageH)
+		x, y = t.pagePoint(px, py)
 		return t.page0, x, y, true
 	}
 	return 0, 0, 0, false
@@ -158,8 +204,11 @@ func (m *clickMap) pdfToCell(page0 int, x, y float64) (col, row int, ok bool) {
 		}
 		px := t.x0 + (gx-t.fx0)/(t.fx1-t.fx0)*(t.x1-t.x0)
 		py := t.y0 + (gy-t.fy0)/(t.fy1-t.fy0)*(t.y1-t.y0)
-		col = m.originCol + int(px/m.pxW*float64(m.cols))
-		row = m.originRow + int(py/m.pxH*float64(m.rows))
+		bx, by := m.imageToBox(px/m.pxW, py/m.pxH)
+		// The nudge keeps a point exactly on a cell's edge from falling into
+		// the cell before it through rounding.
+		col = m.originCol + int(bx*float64(m.cols)+1e-9)
+		row = m.originRow + int(by*float64(m.rows)+1e-9)
 		// A point exactly on the band's far edge computes one cell past the
 		// box; clamp back inside.
 		col = min(col, m.originCol+m.cols-1)
@@ -207,8 +256,13 @@ func (m *clickMap) cellSizePDF(page0 int) (w, h float64, ok bool) {
 		if t.page0 != page0 || t.x1 <= t.x0 || t.y1 <= t.y0 {
 			continue
 		}
-		w = m.pxW / float64(m.cols) / (t.x1 - t.x0) * (t.fx1 - t.fx0) * t.pageW
-		h = m.pxH / float64(m.rows) / (t.y1 - t.y0) * (t.fy1 - t.fy0) * t.pageH
+		// One cell is 1/cols of the box, and the image is fitW of the box wide.
+		fitW, fitH := 1.0, 1.0
+		if m.fitW > 0 && m.fitH > 0 {
+			fitW, fitH = m.fitW, m.fitH
+		}
+		w = m.pxW / float64(m.cols) / fitW / (t.x1 - t.x0) * (t.fx1 - t.fx0) * t.pageW
+		h = m.pxH / float64(m.rows) / fitH / (t.y1 - t.y0) * (t.fy1 - t.fy0) * t.pageH
 		return w, h, true
 	}
 	return 0, 0, false
@@ -1022,11 +1076,16 @@ func (d *DocumentViewer) renderWithTermImg(imagePath string, estimatedLines int,
 	// of going through termimg, which decodes the PNG and retransmits it as raw
 	// RGBA base64 — tens of MB through the PTY per page display in agterm/ghostty.
 	if termType == "kitty" {
+		if tinted, ok := d.highlightedPage(imagePath); ok {
+			imagePath = tinted
+		}
 		newID := nextKittyImageID()
 		if err := kittySendPNG(imagePath, newID, widthChars, estimatedLines, 0); err != nil {
 			return 0
 		}
 		if termViaTmux {
+			cellW, cellH := d.getTerminalCellSize()
+			d.clickMap.fitBox(cellW, cellH)
 			// The upload above drew nothing; these cells are what show it. An
 			// image box larger than the screen (the half-page view fills the
 			// height and lets the width overflow) is clipped by the terminal

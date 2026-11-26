@@ -22,6 +22,7 @@ func (d *DocumentViewer) displayCurrentPage() {
 
 	// Begin synchronized update (Kitty) - buffers output for atomic display
 	fmt.Print("\033[?2026h")
+	d.clearNotice(termHeight)
 
 	if d.skipClear {
 		// Reload case (LaTeX rebuild): do NOT clear or delete anything up front.
@@ -307,6 +308,26 @@ func (d *DocumentViewer) displayMixedPage(pageNum, termWidth, termHeight int) {
 func (d *DocumentViewer) drawOverlays(termWidth int) {
 	d.drawSearchMarkers(termWidth)
 	d.drawFlash(termWidth)
+	d.dropStaleSelection()
+	d.drawNotice(termWidth)
+	// The mouse is the viewer's only while there is a page image to click on.
+	// A page shown as text is real text on the screen: let the terminal and
+	// tmux select it themselves.
+	d.setMouseReporting(d.detectTerminalType() == "kitty" && len(d.clickMap.targets) > 0)
+}
+
+// setMouseReporting asks the terminal to report mouse buttons (in SGR
+// encoding), or to stop.
+func (d *DocumentViewer) setMouseReporting(on bool) {
+	if on == d.mouseOn {
+		return
+	}
+	d.mouseOn = on
+	if on {
+		fmt.Print("\x1b[?1000h\x1b[?1006h")
+	} else {
+		fmt.Print("\x1b[?1006l\x1b[?1000l")
+	}
 }
 
 // drawSearchMarkers paints a yellow block in the margin beside every row of a
@@ -756,6 +777,9 @@ func (d *DocumentViewer) showHelp(inputChan <-chan byte) {
 	p("  P                   - Open in Preview")
 	p("  O                   - Reveal in Finder")
 	p("  v                   - Jump vim to this page's source (synctex)")
+	p("  Drag                - Select text and copy it to the clipboard")
+	p("  Click               - Clear the selection")
+	p("  y                   - Copy the text of the page")
 	p("  Opt+Click           - Jump vim to clicked line (synctex)")
 	p("  Ctrl+Click          - Follow link under click (refs, citations, URLs)")
 	p("  h or ?              - Show this help")
@@ -786,6 +810,11 @@ func (d *DocumentViewer) showDebugInfo(inputChan <-chan byte) {
 	p("=== Debug Info ===")
 	p(fmt.Sprintf("Terminal size: %d cols x %d rows", cols, rows))
 	p(fmt.Sprintf("Cell size: %.1f x %.1f pixels", cellW, cellH))
+	if d.cellSizeGuessed && os.Getenv("DOCVIEWER_CELL_SIZE") == "" {
+		p("  (a guess: tmux does not know the terminal's cell size, and the terminal was")
+		p("  not asked because this pane was not the active one at startup. If clicks")
+		p("  land beside the pointer, restart the viewer or set DOCVIEWER_CELL_SIZE=WxH)")
+	}
 	p(fmt.Sprintf("Pixel size (TIOCGWINSZ): %d x %d", pixelW, pixelH))
 	p(fmt.Sprintf("Calculated terminal pixels: %.0f x %.0f", float64(cols)*cellW, float64(rows)*cellH))
 	p(fmt.Sprintf("Fit mode: %s", d.fitMode))

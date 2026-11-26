@@ -93,6 +93,20 @@ type DocumentViewer struct {
 	mouseCol int
 	mouseRow int
 
+	// Selecting text with the mouse (selection.go). dragFrom/dragTo carry the
+	// cells of a left-button press and release from the stdin-reader goroutine
+	// to handleMouseSelect, under mouseMu like mouseCol/mouseRow; pressAt is
+	// the reader's own note of where the button went down. selection is the
+	// text selected last, notice a line to show once in place of the status
+	// bar (noticeShown: it is on screen now), and mouseOn whether the terminal
+	// is reporting the mouse — all main-goroutine only.
+	dragFrom, dragTo cell
+	pressAt          cell
+	selection        selection
+	notice           string
+	noticeShown      bool
+	mouseOn          bool
+
 	// readingKeys is set once the goroutine that reads keys has started, after
 	// which the terminal must not be queried (see ttyQuery); askedCellWidth and
 	// askedCellHeight keep the cell size the terminal reported before that.
@@ -100,6 +114,12 @@ type DocumentViewer struct {
 	readingKeys     bool
 	askedCellWidth  float64
 	askedCellHeight float64
+
+	// cellSizeGuessed is set when the viewer runs through tmux and neither
+	// tmux nor the terminal could say how large a cell is (see tmuxCellSize):
+	// pages and clicks are then laid out for a size that may not be the real
+	// one. Shown on the debug screen.
+	cellSizeGuessed bool
 
 	// restorePassthrough hands the tmux pane's passthrough option back (nil
 	// outside tmux); kept here for the signal path, which skips Run's defers.
@@ -131,6 +151,11 @@ type DocumentViewer struct {
 	// which the search markers need on every redraw. Cleared alongside
 	// visualContent. Main-thread only.
 	searchLineCache map[int][]searchLine
+
+	// textLineCache caches the text of a page with the position of every
+	// character (pageTextLines), which selecting with the mouse reads. Cleared
+	// alongside searchLineCache. Main-thread only.
+	textLineCache map[int][]textLine
 
 	// toc is the document outline for the 'T' picker, flattened by documentTOC.
 	// Extracted in findContentPages on every (re)open and relayout so its page
@@ -349,6 +374,8 @@ func (d *DocumentViewer) findContentPages() {
 	// links go stale the same way.
 	d.visualContent = make(map[int]bool)
 	d.searchLineCache = make(map[int][]searchLine)
+	d.textLineCache = make(map[int][]textLine)
+	d.selection = selection{}
 	d.toc = documentTOC(d.doc)
 	d.linksMu.Lock()
 	d.pageLinks = make(map[int][]pageLink)
@@ -595,11 +622,12 @@ func (d *DocumentViewer) Run() bool {
 			defer fmt.Print("\x1b[<u")
 		}
 		// SGR mouse reporting (button press/release only, no motion) for the
-		// Opt+click synctex jump. The click→cell mapping relies on the kitty
-		// graphics c/r cell placement, so this stays kitty-gated too.
+		// Opt+click synctex jump, Ctrl+click links and selecting text by
+		// dragging. The click→cell mapping relies on the kitty graphics c/r
+		// cell placement, so this stays kitty-gated too. It is switched on
+		// only while a page image is showing (see setMouseReporting).
 		// readSingleChar consumes every other mouse event silently.
-		fmt.Print("\x1b[?1000h\x1b[?1006h")
-		defer fmt.Print("\x1b[?1006l\x1b[?1000l")
+		defer d.setMouseReporting(false)
 	}
 
 	installSignalCleanup()
@@ -720,6 +748,11 @@ func (d *DocumentViewer) Run() bool {
 				if d.showTOC(inputChan) {
 					continue // jump queued on syncChan; its case redraws
 				}
+			case -7:
+				// Nothing the page shows changed (a notice at most): leave it
+				// rather than transmit the image again.
+				d.showNotice()
+				continue
 			}
 			d.displayCurrentPage()
 		case t := <-syncChan:
@@ -1338,6 +1371,13 @@ func (d *DocumentViewer) handleInput(c byte) int {
 		d.syncToVim()
 	case keyMouseAltClick: // Opt+left click — synctex jump at the clicked point
 		d.handleAltClick()
+	case keyMouseSelect: // left button released — select and copy the text dragged over
+		if !d.handleMouseSelect() {
+			return -7 // nothing on the page changed
+		}
+	case 'y': // copy the text of the page on screen
+		d.copyPageText()
+		return -7
 	case keyMouseCtrlClick: // Ctrl+left click — follow the hyperlink under it
 		if d.handleCtrlClick() {
 			return -5 // internal jump queued on syncChan; its case redraws

@@ -291,3 +291,79 @@ func TestParseSGRMouse(t *testing.T) {
 		t.Error("zero column must not parse")
 	}
 }
+
+// A page shown through tmux is fitted inside its cell box, not stretched over
+// it. Here a 1000x1000px image of a 500x500pt page sits in a box of 20x12
+// cells of 10x20px, 200x240px: it is drawn 200px square, with 20px — one row —
+// of margin above and below.
+func fittedMap() clickMap {
+	m := clickMap{
+		originCol: 5, originRow: 3,
+		cols: 20, rows: 12,
+		pxW: 1000, pxH: 1000,
+		targets: []clickTarget{{
+			page0: 2,
+			x1:    1000, y1: 1000,
+			pageW: 500, pageH: 500,
+			fx1: 1, fy1: 1,
+		}},
+	}
+	m.fitBox(10, 20)
+	return m
+}
+
+func TestClicksFollowAnImageFittedInsideItsBox(t *testing.T) {
+	m := fittedMap()
+	// The first row of the box is margin.
+	if _, _, _, ok := m.cellToPDF(5, 3); ok {
+		t.Error("a click in the margin above the image hit the page")
+	}
+	if _, _, _, ok := m.cellToPDF(5, 14); ok {
+		t.Error("a click in the margin below the image hit the page")
+	}
+	// The second row is the first of the image's ten: its middle is 5% down
+	// the page. Columns have no margin: the first is 2.5% across.
+	page0, x, y, ok := m.cellToPDF(5, 4)
+	if !ok || page0 != 2 || !approxEq(x, 12.5) || !approxEq(y, 25) {
+		t.Errorf("first cell of the image: page %d (%v, %v) ok %v, want page 2 (12.5, 25)", page0, x, y, ok)
+	}
+	_, x, y, _ = m.cellToPDF(24, 13)
+	if !approxEq(x, 487.5) || !approxEq(y, 475) {
+		t.Errorf("last cell of the image: (%v, %v), want (487.5, 475)", x, y)
+	}
+}
+
+func TestMarkersFollowAnImageFittedInsideItsBox(t *testing.T) {
+	m := fittedMap()
+	for _, c := range []struct {
+		x, y     float64
+		col, row int
+	}{
+		{0, 0, 5, 4},      // top-left of the page: the image's first row, not the box's
+		{250, 250, 15, 9}, // the middle
+		{499, 499, 24, 13},
+	} {
+		col, row, ok := m.pdfToCell(2, c.x, c.y)
+		if !ok || col != c.col || row != c.row {
+			t.Errorf("(%v, %v) -> cell (%d, %d) ok %v, want (%d, %d)", c.x, c.y, col, row, ok, c.col, c.row)
+		}
+		// And back: the cell's middle is within half a cell of the point.
+		_, x, y, _ := m.cellToPDF(col, row)
+		if w, h, _ := m.cellSizePDF(2); math.Abs(x-c.x) > w/2+clickEps || math.Abs(y-c.y) > h/2+clickEps {
+			t.Errorf("cell (%d, %d) is centred on (%v, %v), more than half a cell from (%v, %v)", col, row, x, y, c.x, c.y)
+		}
+	}
+	if w, h, ok := m.cellSizePDF(2); !ok || !approxEq(w, 25) || !approxEq(h, 50) {
+		t.Errorf("a cell covers %vx%vpt, want 25x50: the image spans ten rows, not twelve", w, h)
+	}
+}
+
+func TestAnImageThatFillsItsBoxIsLeftAlone(t *testing.T) {
+	m := singleMap(0, 1, 0, 1)
+	_, x0, y0, _ := m.cellToPDF(30, 20)
+	// 80x48 cells of 20x43.15px is 1600x2071px, the image's own size.
+	m.fitBox(20, 2071.0/48)
+	if _, x, y, _ := m.cellToPDF(30, 20); !approxEq(x, x0) || !approxEq(y, y0) {
+		t.Errorf("fitting moved a click from (%v, %v) to (%v, %v)", x0, y0, x, y)
+	}
+}

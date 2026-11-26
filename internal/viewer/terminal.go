@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -154,9 +155,21 @@ var da1Reply = regexp.MustCompile(`\x1b\[\?[0-9;]*c`)
 // the reply between them, and the half that reached the key reader would be
 // taken for typing.
 func ttyQuery(query string) (reply string, ok bool) {
+	acc, end := ttyExchange(query+"\x1b[c", da1Reply)
+	if end == nil {
+		return acc, false
+	}
+	return acc[:end[0]], true
+}
+
+// ttyExchange writes send to the terminal and reads what comes back until it
+// contains a match of end, whose location it returns, or until
+// ttyQueryTimeout, when the location is nil. The same warning as ttyQuery
+// applies: nothing else may be reading the terminal.
+func ttyExchange(send string, end *regexp.Regexp) (reply string, loc []int) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		return "", false
+		return "", nil
 	}
 	defer tty.Close()
 
@@ -166,19 +179,19 @@ func ttyQuery(query string) (reply string, ok bool) {
 	// until the next keypress, and then swallow it.
 	conn, err := tty.SyscallConn()
 	if err != nil {
-		return "", false
+		return "", nil
 	}
 	var oldState *term.State
 	if cerr := conn.Control(func(fd uintptr) { oldState, err = term.MakeRaw(int(fd)) }); cerr != nil || err != nil {
-		return "", false
+		return "", nil
 	}
 	defer conn.Control(func(fd uintptr) { term.Restore(int(fd), oldState) })
 
 	if err := tty.SetReadDeadline(time.Now().Add(ttyQueryTimeout)); err != nil {
-		return "", false
+		return "", nil
 	}
-	if _, err := tty.WriteString(query + "\x1b[c"); err != nil {
-		return "", false
+	if _, err := tty.WriteString(send); err != nil {
+		return "", nil
 	}
 
 	var acc []byte
@@ -186,11 +199,11 @@ func ttyQuery(query string) (reply string, ok bool) {
 	for {
 		n, err := tty.Read(buf)
 		acc = append(acc, buf[:n]...)
-		if loc := da1Reply.FindIndex(acc); loc != nil {
-			return string(acc[:loc[0]]), true
+		if loc := end.FindIndex(acc); loc != nil {
+			return string(acc), loc
 		}
 		if err != nil {
-			return string(acc), false
+			return string(acc), nil
 		}
 	}
 }
@@ -247,6 +260,16 @@ func (d *DocumentViewer) detectCellSize() (float64, float64) {
 	// Try Kitty-specific query first (most accurate)
 	if kw, kh := d.getKittyCellSize(); kw > 0 && kh > 0 {
 		return kw, kh
+	}
+
+	// Through tmux the pane's pixel size below cannot be trusted (see
+	// tmuxCellSize), so what tmux or the terminal said comes first.
+	if termViaTmux {
+		tw, th := d.tmuxCellSize()
+		d.cellSizeGuessed = tw <= 0 || th <= 0
+		if !d.cellSizeGuessed {
+			return tw, th
+		}
 	}
 
 	// Try TIOCGWINSZ pixel size
@@ -324,12 +347,85 @@ func (d *DocumentViewer) getTerminalPixelSize() (int, int) {
 // cellSizeReply matches the answer to CSI 16 t: CSI 6 ; height ; width t.
 var cellSizeReply = regexp.MustCompile(`\x1b\[6;(\d+);(\d+)t`)
 
+// tmuxCellSize finds the size in pixels of a cell of the terminal attached to
+// tmux, or 0, 0 when it cannot be had.
+//
+// It matters more here than anywhere: through tmux a page is fitted into its
+// box of cells keeping its proportions (see clickMap.fitBox), so a wrong cell
+// shape leaves the page smaller than its box and every click, selection and
+// margin marker beside the point.
+//
+// tmux knows the size only if the connection carries the window's size in
+// pixels. Some do not (Coder's ssh among them), and then tmux gives its panes
+// a made-up 16x32 with nothing to tell it from a real answer; hence the
+// question to tmux about what its client reported, and not the pane's pixel
+// size. When tmux does not know, the terminal is asked past tmux. The answer
+// comes back as typing into whichever pane is active, so the question is put
+// only when that pane is this one, and only before the key reader starts (see
+// ttyQuery); later re-detections reuse the answer.
+func (d *DocumentViewer) tmuxCellSize() (float64, float64) {
+	out, err := tmuxCommand("display-message", "-p", tmuxCellInfoFormat)
+	if err != nil {
+		return d.askedCellWidth, d.askedCellHeight
+	}
+	w, h, mayAsk := parseTmuxCellInfo(out)
+	if w > 0 && h > 0 {
+		return w, h
+	}
+	if d.askedCellWidth > 0 && d.askedCellHeight > 0 {
+		return d.askedCellWidth, d.askedCellHeight
+	}
+	if !mayAsk || d.readingKeys {
+		return 0, 0
+	}
+	reply, _ := ttyExchange(tmuxWrap("\x1b[16t"), cellSizeReply)
+	if w, h := parseCellSizeReply(reply); w > 0 && h > 0 {
+		d.askedCellWidth, d.askedCellHeight = w, h
+	}
+	return d.askedCellWidth, d.askedCellHeight
+}
+
+// tmuxCellInfoFormat asks tmux for the cell size its client reported, and for
+// whether this pane is the one the client's typing goes to.
+const tmuxCellInfoFormat = "#{client_cell_width},#{client_cell_height},#{pane_active},#{window_active},#{session_attached}"
+
+// parseTmuxCellInfo reads tmux's answer to tmuxCellInfoFormat: the cell size
+// tmux knows (0, 0 when it does not, or is too old to say), and whether the
+// terminal may be asked — this pane is the active pane of the current window
+// of an attached session, so a reply typed into tmux arrives here.
+func parseTmuxCellInfo(out string) (w, h float64, mayAsk bool) {
+	f := strings.Split(strings.TrimSpace(out), ",")
+	if len(f) != 5 {
+		return 0, 0, false
+	}
+	w, _ = strconv.ParseFloat(f[0], 64)
+	h, _ = strconv.ParseFloat(f[1], 64)
+	if w <= 0 || h <= 0 {
+		w, h = 0, 0
+	}
+	attached, _ := strconv.Atoi(f[4])
+	return w, h, f[2] == "1" && f[3] == "1" && attached >= 1
+}
+
+// parseCellSizeReply reads a cell size out of the answer to CSI 16 t.
+func parseCellSizeReply(reply string) (w, h float64) {
+	m := cellSizeReply.FindStringSubmatch(reply)
+	if m == nil {
+		return 0, 0
+	}
+	h, _ = strconv.ParseFloat(m[1], 64)
+	w, _ = strconv.ParseFloat(m[2], 64)
+	if w <= 0 || h <= 0 {
+		return 0, 0
+	}
+	return w, h
+}
+
 // getKittyCellSize asks a kitty-protocol terminal for its cell size in pixels.
-// Not asked through tmux, which would answer for itself: there the pane's own
-// pixel size (getTerminalPixelSize) is what tmux derived from the terminal.
-// Only asked before the key reader starts (see ttyQuery). A later re-detection,
-// after a resize or the 'r' key, takes the pane's pixel size, and failing that
-// the answer from startup.
+// Not through tmux, which has its own way (tmuxCellSize). Only asked before
+// the key reader starts (see ttyQuery). A later re-detection, after a resize
+// or the 'r' key, takes the pane's pixel size, and failing that the answer
+// from startup.
 func (d *DocumentViewer) getKittyCellSize() (float64, float64) {
 	if d.detectTerminalType() != "kitty" || termViaTmux {
 		return 0, 0
@@ -338,16 +434,9 @@ func (d *DocumentViewer) getKittyCellSize() (float64, float64) {
 		return 0, 0
 	}
 	reply, _ := ttyQuery("\x1b[16t")
-	m := cellSizeReply.FindStringSubmatch(reply)
-	if m == nil {
-		return 0, 0
-	}
-	var cellHeight, cellWidth int
-	fmt.Sscan(m[1], &cellHeight)
-	fmt.Sscan(m[2], &cellWidth)
-	if cellWidth > 0 && cellHeight > 0 {
-		d.askedCellWidth, d.askedCellHeight = float64(cellWidth), float64(cellHeight)
-		return d.askedCellWidth, d.askedCellHeight
+	if w, h := parseCellSizeReply(reply); w > 0 && h > 0 {
+		d.askedCellWidth, d.askedCellHeight = w, h
+		return w, h
 	}
 	return 0, 0
 }
@@ -691,12 +780,29 @@ func (d *DocumentViewer) readSingleChar() byte {
 			if len(params) > 0 && params[0] == '<' {
 				// SGR encoding: ESC [ < btn ; col ; row, final M=press m=release.
 				// btn bits: low 2 = button (0=left), +4 shift, +8 alt, +16 ctrl,
-				// +32 motion, 64/65 wheel. Only Opt+left (btn == 0|8) and
+				// +32 motion, 64/65 wheel. Besides the plain left button
+				// (btn == 0, below), only Opt+left (btn == 0|8) and
 				// Ctrl+left (btn == 0|16; also 2|16 for terminals that apply the
 				// macOS Ctrl+click -> secondary-click translation before
 				// reporting) presses become keys; every other mouse event is
 				// consumed silently.
 				btn, col, row, ok := parseSGRMouse(params[1:])
+				if ok && btn == 0 {
+					// Plain left button: a press notes where a drag starts,
+					// the release ends it (see handleMouseSelect).
+					if final == 'M' {
+						d.pressAt = cell{col, row}
+						continue
+					}
+					if d.pressAt != (cell{}) {
+						d.mouseMu.Lock()
+						d.dragFrom, d.dragTo = d.pressAt, cell{col, row}
+						d.mouseMu.Unlock()
+						d.pressAt = cell{}
+						return keyMouseSelect
+					}
+					continue
+				}
 				if ok && final == 'M' {
 					var key byte
 					switch btn {

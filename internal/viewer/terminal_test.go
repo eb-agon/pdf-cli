@@ -147,3 +147,39 @@ func TestCellSizeReplyIsHeightThenWidth(t *testing.T) {
 		t.Errorf("parsed %v, want height 32 and width 16", m)
 	}
 }
+
+func TestTmuxCellInfo(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		out    string
+		w, h   float64
+		mayAsk bool
+	}{
+		{"tmux knows the size", "17,37,1,1,1\n", 17, 37, true},
+		{"no pixel size on the connection", "0,0,1,1,1", 0, 0, true},
+		{"another pane is active", "0,0,0,1,1", 0, 0, false},
+		{"another window is current", "0,0,1,0,1", 0, 0, false},
+		{"nobody attached", "0,0,1,1,0", 0, 0, false},
+		{"two clients attached", "0,0,1,1,2", 0, 0, true},
+		{"a tmux without the cell formats", ",,1,1,1", 0, 0, true},
+		{"half an answer is no answer", "17,0,1,1,1", 0, 0, true},
+		{"not tmux's answer at all", "no server running", 0, 0, false},
+	} {
+		w, h, mayAsk := parseTmuxCellInfo(c.out)
+		if w != c.w || h != c.h || mayAsk != c.mayAsk {
+			t.Errorf("%s: got %vx%v mayAsk %v, want %vx%v mayAsk %v", c.name, w, h, mayAsk, c.w, c.h, c.mayAsk)
+		}
+	}
+}
+
+func TestCellSizeIsReadFromTheReply(t *testing.T) {
+	// Height comes first in the reply; typing can be mixed in around it.
+	if w, h := parseCellSizeReply("j\x1b[6;37;17tk"); w != 17 || h != 37 {
+		t.Errorf("got %vx%v, want 17x37", w, h)
+	}
+	for _, reply := range []string{"", "\x1b[6;0;17t", "\x1b[4;800;1200t"} {
+		if w, h := parseCellSizeReply(reply); w != 0 || h != 0 {
+			t.Errorf("%q: got %vx%v, want no size", reply, w, h)
+		}
+	}
+}

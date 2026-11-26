@@ -24,6 +24,7 @@ A terminal-based PDF, EPUB, DOCX, HTML, PNG, and JPEG viewer with fuzzy file sea
 - **Fit Modes**: Toggle between height-fit, width-fit, and auto-fit modes
 - **Manual Zoom**: Adjust zoom from 10% to 200%
 - **In-Document Search**: Search for text within documents
+- **Copy Text**: Drag over a page to copy its text to the system clipboard, including over ssh and inside tmux
 - **Navigation Tools**: Follow document links, browse jump history, and fuzzy-search the table of contents
 - **Viewer Control**: Inspect and control running viewers with `dvctl` or `pdf-cli ctl`
 - **Intelligent Text Reflow**: Automatically reformats text to fit your terminal width while preserving paragraphs
@@ -39,6 +40,8 @@ A terminal-based PDF, EPUB, DOCX, HTML, PNG, and JPEG viewer with fuzzy file sea
 | `g` | Go to specific page |
 | `T` | Table of contents overlay (fuzzy search, Enter jumps) |
 | `Ctrl+Click` | Follow links, references, citations, and URLs |
+| Drag | Select text and copy it to the clipboard (click to clear) |
+| `y` | Copy the text of the page on screen |
 | `Cmd+Left` / `Cmd+Right` | Move backward or forward through jump history |
 | `b` | Back to file picker |
 | `/` | Search in document |
@@ -170,10 +173,42 @@ resolution through tmux:
   it found it.
 - If you attach from a different terminal while a page is on screen, press `r`
   (or any key that redraws) to send the page to the new terminal.
+- Clicks and selections are matched to the page using the size of a terminal
+  cell in pixels. tmux only knows it when the connection carries pixel sizes;
+  some do not (Coder's ssh, for one), so at startup the viewer asks the
+  terminal itself, through tmux. That needs the viewer's pane to be the active
+  one when it starts. The debug screen (`d`) says when the size is a guess; if
+  clicks land beside the pointer, restart the viewer in the active pane, or set
+  `DOCVIEWER_CELL_SIZE`. Restart it too after changing the terminal's font size.
 - The thin rule that marks a forward-sync jump is not drawn inside tmux; the
   margin arrows are.
 
 With any other terminal attached, tmux gets the generic renderer as before.
+
+### Selecting and copying text
+
+A page is drawn as a picture, so the terminal has no text of its own to select
+there. In Ghostty and Kitty the viewer does the selecting:
+
+- Drag with the left button across the page. The text between the two ends is
+  selected in reading order (down the column, then on to the next), tinted on
+  the page, and copied. Click anywhere to clear it.
+- `y` copies all the text of the page on screen (both pages of a spread).
+- The copy goes to the clipboard of the machine your terminal runs on, through
+  the terminal (OSC 52), so it works over ssh. Inside tmux it also becomes
+  tmux's newest paste buffer (`prefix ]`).
+- The mouse is reported per character cell, not per pixel. A cell is wider
+  than a letter, so a selection starts and ends on whole words. A cell is often
+  taller than a line of print too, and a row of cells can then hold two lines:
+  the selection takes both, so that it always includes the one you pointed at.
+  The status line shows how the copied text begins. For a finer aim make the
+  page larger: `+`, `f` for fit-width, or the half-page view (`2`).
+- In a scan with a hidden text layer the letters' positions are estimated, and
+  a drag can be a few words off; `y` is exact.
+- In text view (`t`) the page is ordinary terminal text and the viewer lets go
+  of the mouse: select it the way you select anything else in your terminal or
+  in tmux.
+- Hold Shift while dragging for your terminal's own selection at any time.
 
 ### Environment variables
 
